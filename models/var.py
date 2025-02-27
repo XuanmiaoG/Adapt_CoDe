@@ -394,7 +394,106 @@ class VAR(nn.Module):
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
 
+    @torch.no_grad()
+    def compute_nll(
+        self,
+        prefix_tokens: torch.Tensor,   # [B, prefix_length, Cvae] or some shape
+        target_tokens: torch.Tensor,   # [B, current_scale_length]
+        label_B: torch.LongTensor,
+        scale_idx: int = 0
+    ) -> float:
+        """
+        Compute average negative log-likelihood (NLL) for the tokens in `target_tokens`
+        given `prefix_tokens`. For example, each 'scale' in your VAR might decode HxW tokens in parallel.
+        
+        :param prefix_tokens: tokens from previous scales (can be empty if no prefix).
+               shape might be [B, prefix_len, Cvae], or [B, prefix_len].
+        :param target_tokens: the ground-truth or actual tokens for the current scale.
+               shape [B, current_scale_len].
+        :param label_B: class labels if class-conditional, shape [B].
+        :param scale_idx: index of the scale, if needed for specialized logic (pos embeddings, etc.).
+        :return: float scalar = average negative log-likelihood over all tokens in the current scale.
+        """
+        B = prefix_tokens.shape[0]
+        device = prefix_tokens.device
+        
+        # 1) Convert prefix_tokens to embeddings and add position + level embedding, 
+        #    similar to your training forward pass. This is a simplified example:
+        #    We have to replicate what you'd do inside forward(...) or autoregressive_infer_cfg(...)
+        
+        # "sos" or conditional embedding
+        label_B_masked = torch.where(
+            torch.rand(B, device=device) < self.cond_drop_rate,
+            torch.full_like(label_B, self.num_classes),  # unconditional
+            label_B
+        )
+        cond_BD = self.class_emb(label_B_masked)
+        # shape: [B, self.C], embedding for class label
+        
+        # Maybe you'd do something akin to:
+        #  - transform prefix tokens with self.word_embed
+        #  - add pos embedding, lvl_embed, etc.
+        #  - Then concatenate with "sos" for the first scale
+        #  This snippet depends on how your code organizes partial scales. 
+        #  We'll do a simplified variant:
 
+        # (a) embed prefix tokens
+        # If prefix_tokens are already codebook indices: prefix_tokens => self.vae_quant_proxy.embedding(...).
+        # If prefix_tokens are quant embeddings: just pass them through self.word_embed(...) if needed.
+        
+        # for illustration, let's assume prefix_tokens are already shape [B, prefix_len, self.Cvae].
+        prefix_embeddings = self.word_embed(prefix_tokens.float())  # -> shape [B, prefix_len, C]
+        
+        # add position embedding (just assume we have an index offset for scale_idx)
+        offset = sum(self.patch_nums[:scale_idx])**2  # start position
+        pos_slice = self.pos_1LC[:, offset: offset+prefix_embeddings.shape[1], :]
+        lvl_slice = self.lvl_embed(self.lvl_1L[:, offset: offset+prefix_embeddings.shape[1]])
+        prefix_embeddings = prefix_embeddings + lvl_slice + pos_slice
+        
+        # (b) embed the "target_tokens" in teacher-forcing style 
+        # same procedure (some shape [B, scale_len, C])
+        # this is the chunk we want to do cross-entropy over
+        target_embeddings = self.word_embed(self.vae_quant_proxy[0].embedding(target_tokens).transpose(1,2))
+        # or if target_tokens are codebook indices, do the same embedding steps.
+        tpos_slice = self.pos_1LC[:, offset + prefix_embeddings.shape[1]: offset + prefix_embeddings.shape[1] + target_embeddings.shape[1], :]
+        tlvl_slice = self.lvl_embed(self.lvl_1L[:, offset + prefix_embeddings.shape[1]: offset + prefix_embeddings.shape[1] + target_embeddings.shape[1]])
+        target_embeddings = target_embeddings + tlvl_slice + tpos_slice
+        
+        # Now combine everything: [prefix + target]
+        full_input = torch.cat([prefix_embeddings, target_embeddings], dim=1) # shape [B, prefix_len+scale_len, C]
+        
+        attn_bias = self.attn_bias_for_masking[:, :, 0:full_input.shape[1], 0:full_input.shape[1]]
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD).to(full_input.dtype)
+        
+        # 2) Pass through the transformer
+        x = full_input
+        for blk in self.blocks:
+            x = blk(x=x, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        
+        # 3) get logits
+        logits = self.get_logits(x, cond_BD)  # shape [B, (prefix+target_len), V]
+
+        # We only care about the logits for the *target* portion
+        # i.e. slice out the last target_len positions
+        target_len = target_embeddings.shape[1]
+        prefix_len = prefix_embeddings.shape[1]
+        relevant_logits = logits[:, prefix_len : prefix_len+target_len, :]  # shape [B, target_len, V]
+        
+        # 4) compute negative log-likelihood
+        # gather the log-prob of each token in target_tokens
+        log_probs = F.log_softmax(relevant_logits.float(), dim=-1)  # [B, target_len, V]
+        
+        # each row is one position, we gather using target_tokens
+        # ensure target_tokens shape is [B, target_len]
+        # we want index positions for each batch, each position
+        batch_idxs = torch.arange(B, device=device).unsqueeze(1).expand(B, target_len)     # [B, target_len]
+        pos_idxs = torch.arange(target_len, device=device).unsqueeze(0).expand(B, target_len)
+        
+        chosen_log_probs = log_probs[batch_idxs, pos_idxs, target_tokens]  # [B, target_len]
+        
+        # average nll across all B * target_len
+        nll = -chosen_log_probs.mean().item()  # scalar float
+        return nll
 
     @torch.no_grad()
     def autoregressive_inpaint_draft(
